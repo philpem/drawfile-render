@@ -23,7 +23,7 @@ A thin wrapper to produce vector graphics using cairo.
 
 import logging
 
-from math import pi, sin, cos
+from math import pi, sin, cos, sqrt
 
 from typing import Dict, List, Optional, Sequence
 
@@ -236,7 +236,8 @@ class GraphicsContext:
 
     def stroke(self, line_width: Optional[float] = None,
                color: Optional[Sequence[float]] = None, dotted: Optional[bool] = None,
-               dash_pattern: Optional[List[float]] = None) -> None:
+               dash_pattern: Optional[List[float]] = None,
+               line_cap: Optional[int] = None, line_join: Optional[int] = None) -> None:
         """
         Stroke the current path
         """
@@ -246,6 +247,10 @@ class GraphicsContext:
             self.set_color(color=color)
         if dotted is not None:
             self.set_line_style(dotted=dotted, dash_pattern=dash_pattern)
+        if line_cap is not None:
+            self.set_line_cap(cap_style=line_cap)
+        if line_join is not None:
+            self.set_line_join(join_style=line_join)
         self.context.stroke()
 
     def fill(self, color: Optional[Sequence[float]] = None) -> None:
@@ -386,6 +391,28 @@ class GraphicsContext:
             None
         """
         self.context.set_line_width(width=line_width * self.base_line_width)
+
+    def set_line_cap(self, cap_style: int) -> None:
+        """
+        Sets the line cap style (0=butt, 1=round, 2=square). Style 3 (triangle) is
+        handled separately as a filled polygon and should not be passed here.
+        """
+        cap_map = {0: cairo.LINE_CAP_BUTT, 1: cairo.LINE_CAP_ROUND, 2: cairo.LINE_CAP_SQUARE}
+        self.context.set_line_cap(cap_map.get(cap_style, cairo.LINE_CAP_BUTT))
+
+    def set_line_join(self, join_style: int) -> None:
+        """
+        Sets the line join style (0=miter, 1=round, 2=bevel).
+        """
+        join_map = {0: cairo.LINE_JOIN_MITER, 1: cairo.LINE_JOIN_ROUND, 2: cairo.LINE_JOIN_BEVEL}
+        self.context.set_line_join(join_map.get(join_style, cairo.LINE_JOIN_MITER))
+
+    def set_fill_rule(self, even_odd: bool) -> None:
+        """
+        Sets the fill rule. even_odd=True uses even-odd rule; False uses non-zero winding.
+        """
+        rule = cairo.FILL_RULE_EVEN_ODD if even_odd else cairo.FILL_RULE_WINDING
+        self.context.set_fill_rule(rule)
 
     def text(self, text: str, x: float, y: float,
              h_align: int = 0, v_align: int = 0,

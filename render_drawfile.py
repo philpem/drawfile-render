@@ -34,6 +34,7 @@ import ctypes.util
 import io
 import glob
 import logging
+import math
 import os
 import re
 import sys
@@ -160,6 +161,124 @@ def context_colour_from_int(uint: int) -> Sequence[float]:
 
     return [colour_dict["r"] / 255., colour_dict["g"] / 255., colour_dict["b"] / 255.,
             0. if colour_dict["transparent"] else 1.]
+
+
+def _collect_open_subpaths(path_elements: List[Dict]) -> List[Dict]:
+    """
+    Walk a list of path elements and return endpoint/direction info for each open subpath.
+
+    Closed subpaths (those containing a CLOSE element) are excluded because they have
+    no free endpoints and thus need no line caps.
+
+    Each returned dict has:
+        start_x, start_y : first MOVE point (Draw units)
+        start_dx, start_dy : direction FROM start toward interior (Draw units, unnormalised)
+        end_x, end_y : last drawn point (Draw units)
+        end_dx, end_dy : direction FROM interior TOWARD end (Draw units, unnormalised)
+    """
+    result: List[Dict] = []
+
+    cur_x: float = 0.0
+    cur_y: float = 0.0
+    sub_start_x: float = 0.0
+    sub_start_y: float = 0.0
+    start_dx: float = 0.0
+    start_dy: float = 0.0
+    end_dx: float = 0.0
+    end_dy: float = 0.0
+    have_start_dir: bool = False
+    have_end: bool = False
+    in_open_subpath: bool = False
+
+    def push_subpath() -> None:
+        nonlocal in_open_subpath, have_start_dir, have_end
+        if in_open_subpath and have_start_dir and have_end:
+            result.append({
+                'start_x': sub_start_x, 'start_y': sub_start_y,
+                'start_dx': start_dx, 'start_dy': start_dy,
+                'end_x': cur_x, 'end_y': cur_y,
+                'end_dx': end_dx, 'end_dy': end_dy,
+            })
+        in_open_subpath = False
+        have_start_dir = False
+        have_end = False
+
+    for elem in path_elements:
+        t = elem['type']
+        if t == 'END':
+            push_subpath()
+            break
+        elif t == 'MOVE':
+            push_subpath()
+            sub_start_x = float(elem['x'])
+            sub_start_y = float(elem['y'])
+            cur_x, cur_y = sub_start_x, sub_start_y
+            in_open_subpath = True
+        elif t == 'CLOSE':
+            in_open_subpath = False
+            have_start_dir = False
+            have_end = False
+            cur_x, cur_y = sub_start_x, sub_start_y
+        elif t == 'LINE':
+            dx = float(elem['x']) - cur_x
+            dy = float(elem['y']) - cur_y
+            if not have_start_dir:
+                start_dx, start_dy = dx, dy
+                have_start_dir = True
+            end_dx, end_dy = dx, dy
+            cur_x, cur_y = float(elem['x']), float(elem['y'])
+            have_end = True
+        elif t == 'BEZIER':
+            x0, y0 = float(elem['x0']), float(elem['y0'])
+            x1, y1 = float(elem['x1']), float(elem['y1'])
+            x2, y2 = float(elem['x2']), float(elem['y2'])
+            if not have_start_dir:
+                # Start tangent: current point toward first control point
+                dx0, dy0 = x0 - cur_x, y0 - cur_y
+                if abs(dx0) < 1e-6 and abs(dy0) < 1e-6:
+                    dx0, dy0 = x1 - cur_x, y1 - cur_y
+                if abs(dx0) < 1e-6 and abs(dy0) < 1e-6:
+                    dx0, dy0 = x2 - cur_x, y2 - cur_y
+                start_dx, start_dy = dx0, dy0
+                have_start_dir = True
+            # End tangent: second control point toward endpoint
+            edx, edy = x2 - x1, y2 - y1
+            if abs(edx) < 1e-6 and abs(edy) < 1e-6:
+                edx, edy = x2 - x0, y2 - y0
+            if abs(edx) < 1e-6 and abs(edy) < 1e-6:
+                edx, edy = x2 - cur_x, y2 - cur_y
+            end_dx, end_dy = edx, edy
+            cur_x, cur_y = x2, y2
+            have_end = True
+
+    return result
+
+
+def _draw_triangle_cap(context: 'GraphicsContext', apex_x: float, apex_y: float,
+                       dir_x: float, dir_y: float,
+                       cap_length_m: float, half_cap_width_m: float,
+                       color: Sequence[float]) -> None:
+    """
+    Draw a filled triangular arrowhead cap as a standalone path.
+
+    The apex (tip) is at (apex_x, apex_y). dir_x/dir_y is the unit-vector pointing
+    FROM the apex outward (away from the path interior); the triangle base sits
+    cap_length_m behind the apex (toward the path interior).
+    All coordinates are in metres (Cairo space).
+    """
+    length = math.sqrt(dir_x * dir_x + dir_y * dir_y)
+    if length < 1e-12:
+        return
+    dx, dy = dir_x / length, dir_y / length
+    px, py = -dy, dx  # perpendicular unit vector
+    base_cx = apex_x - dx * cap_length_m
+    base_cy = apex_y - dy * cap_length_m
+    context.begin_path()
+    context.move_to(x=apex_x, y=apex_y)
+    context.line_to(x=base_cx + px * half_cap_width_m, y=base_cy + py * half_cap_width_m)
+    context.line_to(x=base_cx - px * half_cap_width_m, y=base_cy - py * half_cap_width_m)
+    context.close_path()
+    context.fill(color=color)
 
 
 class DrawFileRender:
@@ -674,8 +793,23 @@ class DrawFileRender:
 
         # Read path components
         if type_id == 2:
-            has_dash_pattern: bool = (new_object["metadata"]["path_style"] & 128) != 0
+            path_style: int = new_object["metadata"]["path_style"]
+            # Bits 0-1: join style (0=miter, 1=round, 2=bevel)
+            new_object["metadata"]["join_style"] = path_style & 0x03
+            # Bits 2-3: end cap style (0=butt, 1=round, 2=square, 3=triangle)
+            new_object["metadata"]["end_cap"] = (path_style >> 2) & 0x03
+            # Bits 4-5: start cap style (0=butt, 1=round, 2=square, 3=triangle)
+            new_object["metadata"]["start_cap"] = (path_style >> 4) & 0x03
+            # Bit 6: winding rule (0=non-zero, 1=even-odd)
+            new_object["metadata"]["winding_rule"] = (path_style >> 6) & 0x01
+            # Bit 7: dash pattern present
+            has_dash_pattern: bool = bool(path_style & 0x80)
             new_object["metadata"]["has_dash_pattern"] = has_dash_pattern
+            # Bits 8-15: reserved
+            # Bits 16-23: triangle cap width (1/16ths of line width, full width at base)
+            new_object["metadata"]["triangle_cap_width"] = (path_style >> 16) & 0xFF
+            # Bits 24-31: triangle cap length (1/16ths of line width)
+            new_object["metadata"]["triangle_cap_length"] = (path_style >> 24) & 0xFF
 
             if has_dash_pattern:
                 new_object["dash_pattern"] = self.fetch_dash_pattern(position=position + 40)
@@ -927,6 +1061,20 @@ class DrawFileRender:
                                  justify=0)
         # Render path objects
         if item['type_name'] == "Path object":
+            meta = item['metadata']
+            start_cap: int = meta['start_cap']
+            end_cap: int = meta['end_cap']
+
+            # Collect open-subpath endpoint data now if triangle caps are needed,
+            # before the Cairo rendering loop consumes the path list.
+            needs_triangle_caps: bool = (start_cap == 3 or end_cap == 3)
+            open_subpaths: List[Dict] = (
+                _collect_open_subpaths(item['path']) if needs_triangle_caps else []
+            )
+
+            # Set the winding/fill rule for this path (bit 6 of path_style)
+            context.set_fill_rule(even_odd=bool(meta['winding_rule']))
+
             # Start path
             context.begin_path()
 
@@ -953,15 +1101,51 @@ class DrawFileRender:
 
             # Stroke path
             stroke_colour = context_colour_from_int(uint=item['metadata']['outline_colour'])
-            outline_width = max(1, item['metadata']['outline_width'] * self.pixel / context.base_line_width)
+            outline_width = max(1, meta['outline_width'] * self.pixel / context.base_line_width)
             if stroke_colour[3] > 0:
                 # Convert dash pattern from Draw units to metres
                 dash_pattern = None
-                if item['metadata']['has_dash_pattern'] and 'dash_pattern' in item:
+                if meta['has_dash_pattern'] and 'dash_pattern' in item:
                     dash_pattern = [v * self.pixel for v in item['dash_pattern']['sequence']]
+
+                # Cairo applies one cap style to both path ends. For triangle caps (style 3)
+                # always use BUTT so the line ends flush at the triangle base; the arrowhead
+                # is drawn as a separate filled polygon. When only one end is a triangle,
+                # apply the other end's style to the stroke.
+                if start_cap == 3 and end_cap == 3:
+                    cairo_cap: int = 0
+                elif start_cap == 3:
+                    cairo_cap = end_cap
+                elif end_cap == 3:
+                    cairo_cap = start_cap
+                else:
+                    cairo_cap = end_cap
+
                 context.stroke(color=stroke_colour, line_width=outline_width,
-                               dotted=item['metadata']['has_dash_pattern'],
-                               dash_pattern=dash_pattern)
+                               dotted=meta['has_dash_pattern'], dash_pattern=dash_pattern,
+                               line_cap=cairo_cap, line_join=meta['join_style'])
+
+                # Draw triangle caps as filled polygons after the stroke.
+                # Direction vectors are in Draw units; y_pos() flips Y, so negate dy
+                # when converting Draw-space direction to Cairo space.
+                if needs_triangle_caps and open_subpaths:
+                    line_width_m: float = meta['outline_width'] * self.pixel
+                    half_cap_width_m: float = (meta['triangle_cap_width'] / 16.0) * line_width_m / 2.0
+                    cap_length_m: float = (meta['triangle_cap_length'] / 16.0) * line_width_m
+
+                    for sp in open_subpaths:
+                        if start_cap == 3:
+                            # Outward direction at start = reverse of path direction
+                            _draw_triangle_cap(context,
+                                               self.x_pos(sp['start_x']), self.y_pos(sp['start_y']),
+                                               -sp['start_dx'], sp['start_dy'],
+                                               cap_length_m, half_cap_width_m, stroke_colour)
+                        if end_cap == 3:
+                            # Outward direction at end = path direction (dy negated for Cairo)
+                            _draw_triangle_cap(context,
+                                               self.x_pos(sp['end_x']), self.y_pos(sp['end_y']),
+                                               sp['end_dx'], -sp['end_dy'],
+                                               cap_length_m, half_cap_width_m, stroke_colour)
 
         # Render sprite objects
         if item['type_name'] in ("Sprite object", "Transformed sprite object"):
